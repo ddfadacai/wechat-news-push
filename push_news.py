@@ -1,20 +1,17 @@
 #!/usr/bin/env python3
-"""Daily AI news → WeChat push. Crawls articles, extracts content, summarizes."""
+"""Daily AI news → WeChat push. Multi-source: search + RSS, content extraction, summarization."""
 
-import os, json, random, re, time, ssl, html as html_mod
+import os, json, random, re, time, ssl, html as html_mod, sys
 import urllib.request, urllib.parse
 from datetime import datetime, timezone, timedelta
 
 BOT_TOKEN = os.environ["ILINK_BOT_TOKEN"]
 TO_USER   = os.environ["ILINK_USER_ID"]
 BASE_URL  = "https://ilinkai.weixin.qq.com"
-GROQ_KEY  = os.environ.get("GROQ_API_KEY", "")
-DEEPSEEK_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 
 # ── WeChat push ──────────────────────────────────────────────────
 
 def push_wechat(text: str):
-    """Push text to WeChat ClawBot via ilink API."""
     chunks = [text[i:i+3800] for i in range(0, len(text), 3800)]
     ctx = ssl.create_default_context()
     for c in chunks:
@@ -41,118 +38,211 @@ def push_wechat(text: str):
 
 # ── Web helpers ──────────────────────────────────────────────────
 
-def fetch_url(url: str, timeout=10) -> str:
-    """Fetch URL and return text content."""
+def http_get(url: str, timeout=12) -> str:
     req = urllib.request.Request(url, headers={
-        "User-Agent": "Mozilla/5.0 (compatible; NewsBot/1.0)",
-        "Accept": "text/html,application/xhtml+xml",
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
     })
     resp = urllib.request.urlopen(req, context=ssl.create_default_context(), timeout=timeout)
     return resp.read().decode("utf-8", errors="replace")
 
-def search_ddg(query: str, n=8) -> list[dict]:
-    """Search DuckDuckGo HTML and return list of {title, url, snippet}."""
-    url = f"https://html.duckduckgo.com/html/?q={urllib.parse.quote(query)}"
-    html = fetch_url(url, timeout=15)
-    results = []
-    # Parse DDG HTML results
-    # Each result is in <a class="result__a"> for title/url and <a class="result__snippet"> for snippet
-    title_pattern = re.compile(r'<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', re.DOTALL)
-    snippet_pattern = re.compile(r'<a[^>]*class="result__snippet"[^>]*>(.*?)</a>', re.DOTALL)
-
-    titles = title_pattern.findall(html)
-    snippets = snippet_pattern.findall(html)
-
-    for i, (href, title) in enumerate(titles[:n]):
-        title = re.sub(r'<[^>]+>', '', title).strip()
-        if not title:
-            continue
-        snippet = ""
-        if i < len(snippets):
-            snippet = re.sub(r'<[^>]+>', '', snippets[i]).strip()
-        # DDG URLs are wrapped in redirect
-        parsed = urllib.parse.urlparse(href)
-        qs = urllib.parse.parse_qs(parsed.query)
-        real_url = qs.get('uddg', [href])[0]
-        results.append({"title": title, "url": real_url, "snippet": snippet})
-    return results
-
-# ── Content extraction ───────────────────────────────────────────
-
-def extract_article(url: str) -> str | None:
-    """Fetch article and extract clean text content."""
-    try:
-        html = fetch_url(url, timeout=12)
-    except Exception:
-        return None
-
-    # Try trafilatura first
-    try:
-        import trafilatura
-        text = trafilatura.extract(html, include_comments=False, include_tables=False)
-        if text and len(text) > 200:
-            return text.strip()
-    except ImportError:
-        pass
-
-    # Fallback: basic HTML text extraction
-    text = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL)
-    text = re.sub(r'<style[^>]*>.*?</style>', '', text, flags=re.DOTALL)
+def clean_html(html: str) -> str:
+    """Strip HTML tags and entities, return clean text."""
+    text = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL|re.IGNORECASE)
+    text = re.sub(r'<style[^>]*>.*?</style>', '', text, flags=re.DOTALL|re.IGNORECASE)
     text = re.sub(r'<[^>]+>', ' ', text)
     text = html_mod.unescape(text)
     text = re.sub(r'\s+', ' ', text).strip()
-    return text[:3000] if text else None
+    return text
+
+# ── News sources ─────────────────────────────────────────────────
+
+def search_duckduckgo(query: str, n=5) -> list[dict]:
+    """Search DuckDuckGo using duckduckgo_search library."""
+    try:
+        from duckduckgo_search import DDGS
+        results = []
+        with DDGS() as ddgs:
+            for r in ddgs.text(query, max_results=n, region="cn-zh"):
+                results.append({"title": r["title"], "url": r["href"], "snippet": r["body"]})
+        return results
+    except Exception as e:
+        print(f"   DuckDuckGo搜索失败: {e}")
+        return []
+
+
+def fetch_rss_feeds() -> list[dict]:
+    """Fetch AI news from known Chinese tech RSS feeds."""
+    feeds = [
+        ("https://www.jiqizhixin.com/rss", "机器之心"),
+        ("https://feedx.net/rss/qbitai.xml", "量子位"),
+        ("https://www.36kr.com/feed", "36氪"),
+    ]
+
+    articles = []
+    try:
+        import feedparser
+    except ImportError:
+        print("   feedparser未安装，跳过RSS")
+        return articles
+
+    for url, source in feeds:
+        try:
+            feed = feedparser.parse(url)
+            for entry in feed.entries[:5]:
+                title = entry.get("title", "").strip()
+                if not title or len(title) < 5:
+                    continue
+                link = entry.get("link", "")
+                summary = clean_html(entry.get("summary", entry.get("description", "")))
+                summary = summary[:300]
+                # Filter: only AI-related
+                ai_kw = ["AI", "人工智能", "大模型", "GPT", "Claude", "DeepSeek", "Copilot",
+                          "机器人", "具身", "编程", "代码", "Agent", "LLM", "开源", "人形"]
+                if not any(kw.lower() in (title + summary).lower() for kw in ai_kw):
+                    continue
+                articles.append({"title": title, "url": link, "snippet": summary, "source": source})
+        except Exception as e:
+            print(f"   RSS {source} 失败: {e}")
+
+    return articles
+
+
+def extract_article_content(url: str) -> str | None:
+    """Fetch article and extract clean text."""
+    try:
+        html = http_get(url, timeout=10)
+    except Exception:
+        return None
+    try:
+        import trafilatura
+        text = trafilatura.extract(html, include_comments=False, include_tables=False,
+                                    favor_precision=True)
+        if text and len(text) > 150:
+            return text.strip()
+    except Exception:
+        pass
+    # Fallback
+    return clean_html(html)[:2500]
+
+
+def discover_news() -> list[dict]:
+    """Multi-source news discovery. Returns list of {title, url, snippet, content, source}."""
+    all_articles = []
+    seen = set()
+
+    def add_articles(items):
+        for a in items:
+            key = a["title"][:40]
+            if key not in seen and len(a["title"]) > 5:
+                seen.add(key)
+                all_articles.append(a)
+
+    # 1. DuckDuckGo search
+    print("   [1/3] DuckDuckGo 搜索...")
+    for q in ["AI编程 最新进展", "具身智能 机器人 最新动态", "大模型 Agent 开源 发布"]:
+        results = search_duckduckgo(q, n=4)
+        add_articles(results)
+        print(f"        「{q}」→ {len(results)} 条")
+
+    # 2. RSS feeds
+    print("   [2/3] RSS 源抓取...")
+    rss_articles = fetch_rss_feeds()
+    add_articles(rss_articles)
+    print(f"        RSS → {len(rss_articles)} 条")
+
+    if not all_articles:
+        print("   [3/3] 无新闻源可用")
+        return []
+
+    # Score and rank
+    ai_kw = ["AI", "编程", "代码", "Copilot", "Claude", "GPT", "DeepSeek", "Qwen",
+             "具身", "机器人", "人形", "Figure", "Tesla", "灵巧手", "大模型",
+             "开源", "融资", "发布", "Agent", "MCP", "具身智能", "Coding"]
+    scored = []
+    for a in all_articles:
+        score = sum(1 for kw in ai_kw if kw.lower() in (a["title"] + a.get("snippet", "")).lower())
+        scored.append((score, a))
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    # Extract content for top articles
+    print(f"   [3/3] 爬取正文 (top {min(6, len(scored))})...")
+    articles = []
+    for score, a in scored[:6]:
+        print(f"        {a['title'][:40]}...", end="")
+        if not a.get("content"):
+            a["content"] = extract_article_content(a["url"])
+        if a.get("content"):
+            print(f" ✓ ({len(a['content'])}字)")
+        else:
+            print(" ✗ (无内容)")
+        articles.append(a)
+
+    return articles
+
 
 # ── Summarization ────────────────────────────────────────────────
 
-def summarize_articles(articles: list[dict]) -> str:
-    """Summarize articles using AI (if key available) or extractive method."""
-    # Build combined content
-    combined = []
+def summarize(articles: list[dict]) -> str:
+    """Generate summary. Tries AI first, falls back to extractive."""
+    # Collect article content
+    items_text = []
     for i, a in enumerate(articles):
-        content = a.get("content", a.get("snippet", ""))
+        content = a.get("content") or a.get("snippet", "")
         if content:
-            combined.append(f"[{i+1}] 标题：{a['title']}\n内容：{content[:1000]}")
-    full_text = "\n\n---\n\n".join(combined)
+            items_text.append(f"[{i+1}] {a['title']}\n{content[:800]}")
 
-    # Try AI summarization
-    ai_summary = _try_ai_summary(articles, full_text)
-    if ai_summary:
-        return ai_summary
+    if not items_text:
+        return "⚠️ 今日未能获取有效内容。"
 
-    # Fallback: extractive summary using textrank
-    return _extractive_summary(articles)
+    full_text = "\n\n---\n\n".join(items_text)
+
+    # Try AI
+    ai_result = _ai_summarize(articles, full_text)
+    if ai_result:
+        return ai_result
+
+    # Fallback: extractive
+    return _extractive_summarize(articles)
 
 
-def _try_ai_summary(articles: list[dict], full_text: str) -> str | None:
-    """Try AI summarization via Groq or DeepSeek."""
-    prompt = f"""你是AI领域资深编辑。以下是今日AI领域（侧重AI编程、具身智能）的新闻原文，请筛选3-5条最重要的，用中文撰写精炼快讯。
+def _ai_summarize(articles: list[dict], full_text: str) -> str | None:
+    """Try Groq or DeepSeek API for quality summary."""
+    prompt = f"""你是AI领域资深编辑。请从以下新闻原文中筛选3-5条最重要的，撰写精炼中文快讯。
+
+格式（严格按此）：
+## 标题1
+发生了什么：（2-3句话）
+为什么重要：（1句话）
+
+## 标题2
+发生了什么：（2-3句话）
+为什么重要：（1句话）
 
 要求：
-- 每条1个小标题 + 用2-3句话说明核心内容 + 1句话点出「为什么值得关注」
-- 语言精简，适合手机微信阅读，不要输出任何URL
-- 用「## 」开头作为分隔，如「## 标题」
-- 全文不超过800字
+- 聚焦AI编程(AI coding)和具身智能(embodied AI)
+- 语言精炼，适合手机阅读
+- 不输出任何URL
+- 全文不超过600字
 
 新闻原文：
-{full_text[:4000]}"""
+{full_text[:5000]}"""
 
-    api_configs = [
-        # Try Groq first
-        (GROQ_KEY, "https://api.groq.com/openai/v1/chat/completions",
+    configs = [
+        (os.environ.get("GROQ_API_KEY"), "https://api.groq.com/openai/v1/chat/completions",
          {"model": "llama-3.3-70b-versatile", "messages": [
-             {"role": "system", "content": "你是专业科技编辑，用简洁中文提炼AI新闻。"},
+             {"role": "system", "content": "你是专业AI科技编辑，擅长用简洁中文提炼科技新闻要点。"},
              {"role": "user", "content": prompt}
-         ], "temperature": 0.5, "max_tokens": 1200}),
-        # Try DeepSeek
-        (DEEPSEEK_KEY, "https://api.deepseek.com/chat/completions",
+         ], "temperature": 0.4, "max_tokens": 1000}),
+        (os.environ.get("DEEPSEEK_API_KEY"), "https://api.deepseek.com/chat/completions",
          {"model": "deepseek-chat", "messages": [
-             {"role": "system", "content": "你是专业科技编辑，用简洁中文提炼AI新闻。"},
+             {"role": "system", "content": "你是专业AI科技编辑，擅长用简洁中文提炼科技新闻要点。"},
              {"role": "user", "content": prompt}
-         ], "temperature": 0.5, "max_tokens": 1200}),
+         ], "temperature": 0.4, "max_tokens": 1000}),
     ]
 
-    for api_key, endpoint, payload in api_configs:
+    for api_key, endpoint, payload in configs:
         if not api_key:
             continue
         try:
@@ -164,100 +254,53 @@ def _try_ai_summary(articles: list[dict], full_text: str) -> str | None:
             )
             resp = urllib.request.urlopen(req, timeout=30)
             result = json.loads(resp.read().decode())
-            content = result["choices"][0]["message"]["content"]
-            return content.strip()
+            return result["choices"][0]["message"]["content"].strip()
         except Exception as e:
-            print(f"   AI API ({endpoint}) 失败: {e}")
+            print(f"   AI API 失败: {e}")
 
     return None
 
 
-def _extractive_summary(articles: list[dict]) -> str:
-    """Extractive summarization: extract key sentences from articles."""
+def _extractive_summarize(articles: list[dict]) -> str:
+    """Extractive: pick key sentences per article."""
     lines = []
-    for i, a in enumerate(articles[:5], 1):
-        content = a.get("content", a.get("snippet", ""))
+    for a in articles[:5]:
+        content = a.get("content") or a.get("snippet", "")
         if not content or len(content) < 30:
             continue
 
-        # Extract 2-3 key sentences
+        # Classify
+        title_lower = a["title"].lower()
+        if any(kw in title_lower for kw in ["机器人","具身","人形","机械臂","figure","tesla","灵巧"]):
+            emoji = "🤖"
+        elif any(kw in title_lower for kw in ["融资","收购","市值","股价","亿"]):
+            emoji = "💰"
+        elif any(kw in title_lower for kw in ["开源","发布","推出"]):
+            emoji = "🚀"
+        else:
+            emoji = "💻"
+
+        lines.append(f"\n{emoji} {a['title']}")
+
+        # Extract key sentences
         sentences = re.split(r'[。！？\n]', content)
-        sentences = [s.strip() for s in sentences if len(s.strip()) > 15]
-
-        tag_emoji = "🤖" if any(kw in a['title'] for kw in ["机器人","具身","人形","机械臂","Figure","Tesla"]) else "💻"
-        lines.append(f"\n{tag_emoji} {a['title']}")
-
-        # Pick sentences: first + longest meaningful
-        key_sentences = []
-        if sentences:
-            key_sentences.append(sentences[0])
-        # Add 1-2 more informative sentences
-        for s in sentences[1:]:
-            if len(key_sentences) >= 3:
+        sentences = [s.strip() for s in sentences if len(s.strip()) > 12]
+        picked = []
+        for s in sentences:
+            if len(picked) >= 3:
                 break
-            if len(s) > 25 and s not in key_sentences:
-                # Prefer sentences with numbers, names, or key terms
-                if re.search(r'[\d万亿%亿美元]|[A-Z][a-z]{3,}|发布|推出|突破|融资|开源|收购', s):
-                    key_sentences.append(s)
+            if s not in picked and len(s) > 15:
+                # Prefer sentences with data or key terms
+                if re.search(r'[\d万亿%亿美元倍]|[A-Z][a-z]{3,}|发布|推出|突破|首次|融资|开源', s):
+                    picked.append(s)
+        # If not enough, just take first sentences
+        if len(picked) < 2:
+            picked = sentences[:3]
 
-        for s in key_sentences:
-            lines.append(f"  {s}")
+        for s in picked:
+            lines.append(f"  · {s}")
 
-    return "\n".join(lines)
-
-
-# ── News discovery ───────────────────────────────────────────────
-
-def discover_articles(queries: list[str]) -> list[dict]:
-    """Search for articles, deduplicate, extract content."""
-    all_articles = []
-    seen_urls = set()
-
-    for query in queries:
-        print(f"   搜索: {query}")
-        results = search_ddg(query, n=5)
-        for r in results:
-            if r["url"] in seen_urls:
-                continue
-            seen_urls.add(r["url"])
-            all_articles.append(r)
-
-    if not all_articles:
-        return []
-
-    # Score and rank: prefer articles with meaningful titles
-    scored = []
-    for a in all_articles:
-        score = 0
-        title = a["title"]
-        # Prefer Chinese content
-        if re.search(r'[\u4e00-\u9fff]', title):
-            score += 3
-        # Prefer AI-coding / embodied intelligence related
-        keywords = ["AI", "编程", "代码", "Copilot", "Claude", "GPT", "DeepSeek", "Qwen",
-                     "具身", "机器人", "人形", "Figure", "Tesla Bot", "灵巧手", "大模型",
-                     "开源", "融资", "发布", "Agent", "MCP", "具身智能"]
-        for kw in keywords:
-            if kw.lower() in title.lower():
-                score += 1
-        # Penalize generic titles
-        if len(title) < 8:
-            score -= 2
-        scored.append((score, a))
-
-    scored.sort(key=lambda x: x[0], reverse=True)
-
-    # Extract content for top articles
-    articles = []
-    for score, a in scored[:8]:
-        print(f"   爬取: {a['title'][:40]}...")
-        content = extract_article(a["url"])
-        a["content"] = content
-        articles.append(a)
-        if len(articles) >= 6:
-            break
-
-    return articles
+    return "\n".join(lines) if lines else "⚠️ 今日未能获取有效内容。"
 
 
 # ── Main ─────────────────────────────────────────────────────────
@@ -266,36 +309,25 @@ def main():
     beijing = timezone(timedelta(hours=8))
     today = datetime.now(beijing).strftime("%m月%d日")
 
-    queries = [
-        "AI编程 最新进展 2026",
-        "具身智能 机器人 最新动态",
-        "AI coding agent 大模型 发布 开源",
-    ]
-
-    print("🔍 搜索...")
-    articles = discover_articles(queries)
+    print("🔍 收集新闻...")
+    articles = discover_news()
 
     if not articles:
-        print("❌ 未获取到新闻")
-        push_wechat(f"📰 AI 日报 | {today}\n\n⚠️ 今日暂无AI新闻数据。")
+        push_wechat(f"📰 AI 日报 | {today}\n\n⚠️ 今日暂无AI领域重要新闻。")
         return
 
-    print(f"\n📝 总结中 ({len(articles)} 篇文章)...")
-    summary = summarize_articles(articles)
+    print(f"\n📝 生成摘要 ({len(articles)} 篇)...")
+    summary = summarize(articles)
 
-    # Build final message
-    has_ai = bool(GROQ_KEY or DEEPSEEK_KEY)
-    label = "🤖 AI 精编" if has_ai else "📋 智能提取"
+    label = "🤖 AI精编" if (os.environ.get("GROQ_API_KEY") or os.environ.get("DEEPSEEK_API_KEY")) else "📋 智能提取"
 
-    msg = f"📰 AI 日报 | {today}\n聚焦 AI Coding × 具身智能 | {label}\n"
+    msg = f"📰 AI 日报 | {today} | {label}\n聚焦 AI Coding × 具身智能\n"
     msg += summary
-    msg += f"\n\n── 云端自动推送 · 无需电脑开机 ──"
+    msg += f"\n\n── 云端自动 · 电脑关机也能收 ──"
 
-    print(f"   {len(msg)} 字符")
-    print("📤 推送微信...")
+    print(f"   {len(msg)} 字符 → 推送微信")
     n = push_wechat(msg)
     print(f"✅ 已推送 {n} 条消息")
-
 
 if __name__ == "__main__":
     main()
