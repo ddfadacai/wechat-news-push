@@ -82,7 +82,7 @@ def fetch_rss(query: str) -> list[dict]:
 
 # ── AI summarization (optional, uses Groq free tier) ─────────────
 
-def summarize_with_ai(items: list[dict]) -> tuple[str, list[str]]:
+def summarize_with_ai(items: list[dict]) -> tuple:
     """Use Groq API to curate and summarize news. Falls back to basic mode."""
     api_key = os.environ.get("GROQ_API_KEY", "")
     if not api_key:
@@ -124,8 +124,9 @@ def summarize_with_ai(items: list[dict]) -> tuple[str, list[str]]:
         result = json.loads(resp.read().decode())
         content = result["choices"][0]["message"]["content"]
         used = True
-    except Exception:
-        content, used = _basic_summary(items)
+    except Exception as e:
+        print(f"   AI API 不可用({e})，使用基础摘要")
+        content = _basic_summary(items)
         used = False
 
     return content, used
