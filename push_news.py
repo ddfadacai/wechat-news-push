@@ -132,16 +132,23 @@ def discover_news() -> list[dict]:
     all_articles = []
     seen = set()
 
+    def is_chinese_title(title: str) -> bool:
+        """标题至少包含3个中文字符"""
+        return len(re.findall(r'[\u4e00-\u9fff]', title)) >= 3
+
     def add_articles(items):
         for a in items:
-            key = a["title"][:40]
-            if key not in seen and len(a["title"]) > 5:
+            title = a["title"]
+            if not is_chinese_title(title):
+                continue
+            key = title[:40]
+            if key not in seen and len(title) > 5:
                 seen.add(key)
                 all_articles.append(a)
 
     # 1. DuckDuckGo search
     print("   [1/3] DuckDuckGo 搜索...")
-    for q in ["AI编程 最新进展", "具身智能 机器人 最新动态", "大模型 Agent 开源 发布"]:
+    for q in ["AI编程 最新进展 中文", "具身智能 人形机器人 中文", "大模型 开源 Agent 中文科技"]:
         results = search_duckduckgo(q, n=4)
         add_articles(results)
         print(f"        「{q}」→ {len(results)} 条")
@@ -186,12 +193,15 @@ def discover_news() -> list[dict]:
 
 def summarize(articles: list[dict]) -> str:
     """Generate summary. Tries AI first, falls back to extractive."""
-    # Collect article content
+    # Collect article content (Chinese articles only)
     items_text = []
     for i, a in enumerate(articles):
+        title = a.get("title", "")
+        if len(re.findall(r'[\u4e00-\u9fff]', title)) < 3:
+            continue  # skip English-only articles
         content = a.get("content") or a.get("snippet", "")
-        if content:
-            items_text.append(f"[{i+1}] {a['title']}\n{content[:800]}")
+        if content and len(re.findall(r'[\u4e00-\u9fff]', content)) > 10:
+            items_text.append(f"[{i+1}] {title}\n{content[:800]}")
 
     if not items_text:
         return "⚠️ 今日未能获取有效内容。"
@@ -225,6 +235,7 @@ def _ai_summarize(articles: list[dict], full_text: str) -> str | None:
 - 语言精炼，适合手机阅读
 - 不输出任何URL
 - 全文不超过600字
+- 全部使用中文输出，不允许出现英文内容（专业名词如GPT、Claude、API等除外）
 
 新闻原文：
 {full_text[:5000]}"""
@@ -282,9 +293,14 @@ def _extractive_summarize(articles: list[dict]) -> str:
 
         lines.append(f"\n{emoji} {a['title']}")
 
-        # Extract key sentences
+        # Extract key sentences (Chinese only)
         sentences = re.split(r'[。！？\n]', content)
         sentences = [s.strip() for s in sentences if len(s.strip()) > 12]
+        # Filter: prefer Chinese sentences
+        zh_sentences = [s for s in sentences if len(re.findall(r'[\u4e00-\u9fff]', s)) > 4]
+        if not zh_sentences:
+            continue  # skip English-only articles
+        sentences = zh_sentences
         picked = []
         for s in sentences:
             if len(picked) >= 3:
