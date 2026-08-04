@@ -86,7 +86,7 @@ def summarize_with_ai(items: list[dict]) -> tuple:
     """Use Groq API to curate and summarize news. Falls back to basic mode."""
     api_key = os.environ.get("GROQ_API_KEY", "")
     if not api_key:
-        return _basic_summary(items)
+        return _basic_summary(items), False
 
     # Build prompt
     items_text = "\n".join(
